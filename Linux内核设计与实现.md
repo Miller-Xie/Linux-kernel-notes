@@ -3,6 +3,226 @@
 
 # Linux内核设计与实现
 
+## 第3章 进程管理
+
+## 第4章 进程调度
+
+## 第5章 系统调用
+
+## 第6章 内核数据结构
+
+## 第7章 中断和中断处理
+
+## 第8章 下半部和推后执行的工作
+
+ ## 第12章 内存管理
+
+> 内核不能像用户空间那样奢侈的使用内存，获取内存币用户空间复杂很多
+
+### 12.1 页
+
+内核把物理页作为内核管理的基本单元，内存管理单元（MMU）是管理内存并将虚拟内存转换为物理内存的硬件，它以页为单位来管理系统中的页表
+
+结构体struct page表示系统中的每个物理页
+
+```c
+struct page {
+    unsigned long        flags,
+    atomic_t             _count,
+    atomic_t             _mapcount,
+    unsigned long        private,
+    struct address_space *mapping,
+    pgoff_t              index,
+    struct list_head     lru,
+    void                 *virtual
+};
+```
+
+* `flags`域，用来存放页的状态（包括是不是脏的，是不是锁定在内存），每一位单独表示一种状态，至少可以表示32中不同的状态
+* `_count`域，存放页的引用计数，-1时内核没有引用该页，在新的内存分配中可以使用。内核调用`page_count()`检查该域，返回0表示页空闲，返回正整数表示正在使用
+* 页可以由页缓存使用（此时，mapping域指向页关联的address_space对象），或者作为私有数据（`private`指向），或者作为进程页表中的映射
+* `virtual`域，页的虚拟地址，当页在高端内存（不会永久映射到内核空间）中时，这个域为`NULL`
+
+**注意**：
+
+1. `page`结构与物理页相关，并非与虚拟页相关，它仅仅描述当前时刻在相关物理中存放的数据（由于交换等原因，关联的数据继续存在，但是和当前物理页不再关联），它对于页的描述是短暂的
+2. 页的拥有者可能是用户空间进程、动态分配的内核数据，静态内核数据或者页高速缓存等
+
+### 12.2 区
+
+Linux主要使用四种区：
+
+* ZONE_DMA，其中包含的页只能进行DMA操作（直接内存访问）
+* ZONE_DMA32，和ZONE_DMA类似，不同之处是只能被32位设备访问
+* ZONE_NORMAL，包含能够正常映射的页
+* ZONE_HIGHMEM，包含“高端内存”，其中的页不能永久地映射到内核空间
+
+> 高端内存，由于一些体系结构的物理内存比虚拟内存大的多，为了充分利用物理内存，将物理内存中的部分区域划分为高端内存，他们不能永久地映射到内核空间，而是动态的映射
+>
+> 在32位x86体系中，ZONE_HIGHMEM为高于896MB的所有物理内存，其余内存为低端内存，其中ZONE_NORMAL为16MB到896MB的物理内存，ZONE_DMA为小于16MB的物理内存
+>
+> x86-64系统没有高端内存区
+
+|      区      |      描述      | 物理内存 |
+| :----------: | :------------: | :------: |
+|   ZONE_DMA   |  DMA使用的页   |  < 16MB  |
+| ZONE_NORMAL  | 正常可寻址的页 | 16~896MB |
+| ZONE_HIGHMEM |  动态映射的页  | > 896MB  |
+
+每个区使用结构体`zone`表示，具体结构详见**P206**
+
+域说明：
+
+* `lock`域，是一个自旋锁，防止结构被并发访问，这个域只保护结构，不保护驻留在这个区中的页
+* `watermark`域，水位值，为每个内存区设置合理的内存消耗基准
+* `name`域，表示区的名字，三个区的名字分别为"DMA","Normal","HighMem"	
+
+### 12.3 获得页
+
+* 分配2<sup>order</sup>(1<<order)个**连续**的物理内存页，返回的指针指向第一个页的page结构体
+
+```c
+struct page *alloc_pages(gfp_t gfp_mask, unsigned int order);
+```
+
+* 将指定的物理页转换为它的逻辑地址（虚拟内存地址），返回的指针指向物理页所在的逻辑地址
+
+```c
+void *page_address(struct page *page);
+```
+
+* 和`alloc_pages()`功能类似，不过它直接返回请求的第一个页的逻辑地址
+
+```c
+unsigned long __get_free_pages(gfp_t fp_mask, unsigned int order)
+```
+
+* 只分配一页的函数
+
+```c
+struct page *alloc_page(gfp_t gfp_mask);
+unsigned long __get_free_page(gfp_t fp_mask)
+```
+
+#### 12.3.1 获得填充为0的页
+
+* 分配的所有页内容全为0，返回执行逻辑地址的指针
+
+```c
+unsigned long get_zeroed_page(unsigned int gfp_mask)
+```
+
+**注意**：为了防止页中留下一般随机的垃圾信息包含一些敏感信息，一般用户空间在获取页的时候，内容最好全部填充为0
+
+#### 12.3.2 释放页
+
+```c
+void __free_pages(struct page *page, unsigned int order);
+void free_pages(unsigned long addr, unsigned int order);
+void free_page(unsigned long addr)
+```
+
+**注意**：传递了错误的struct page、地址或者order参数，都可能导致系统崩溃，因为内核是完全相信自己的
+
+### 12.4 kmalloc()
+
+* 以字节为单位分配内存
+* 可以获得以字节为单位的一块内核内存
+
+```c
+void *kmalloc(size_t size, gfp_t flags);
+```
+
+#### 12.4.1 gfp_mask标志
+
+标志分为三类：
+
+* 行为修饰符
+* 区修饰符
+* 类型修饰符
+
+标志具体说明详见**P209**
+
+#### 12.4.2 kfree()
+
+* 释放由`kmalloc()`分配的内存
+
+```c
+void kfree(const void *ptr);
+```
+
+### 12.5 vmalloc()
+
+和`kmalloc()`类似，不同之处在于`vmalloc()`分配的内存虚拟内存连续，但是物理内存不一定连续，而`kmalloc()`分配的物理内存也是连续的
+
+`vmalloc()`正是用户空间分配内存的方式：有`malloc()`分配的内存页在进程的虚拟内存中是连续的，但是物理内存不保证连续。大多情况下，只有硬件设备才需要连续的物理内存，他们不理解什么是虚拟内存
+
+### 12.6 slab层
+
+> Linux内核提供slab层（即slab分配器），作为通用数据结构缓存层
+
+#### 12.6.1 slab的设计
+
+> slab层将不同的对象划分为**高速缓存组**，每个高速缓存组存放不同类型的对象，例如，分别存放进程描述符(task_struct结构的空闲链表)，索引节点对象(struct inode)
+
+* `kmalloc()`建立在slab层之上，使用了一组通用高速缓存
+* 一般slab仅仅由一页组成，每个高速缓存由多个slab组成
+* 每个slab包含一些对象成员，对象指的是被缓存的数据结构
+* slab包含三种状态：满、部分满或空
+
+高速缓存使用结构体`kmem_cache`表示，这个结构包括三个链表：`slabs_full`, `slabs_partial`和`slabs_empty`，这些链表包含高速缓存中的所有slab
+
+slab使用slab描述符表示，详见**P216**
+
+```c
+struct slab {
+    ...
+};
+```
+
+slab分配器使用`__get_free_pages()`创建新的slab
+
+#### 12.6.2 slab分配器的接口
+
+* 创建一个新的高速缓存
+  * `name`：高速缓存的名字
+  * `size`：高速缓存中每个元素的大小
+  * `align`：slab内第一个对象的偏移量，用来确保在页内进行特定的对齐
+  * `flags`：可选的设置项，控制高速缓存的行为，详见**P218**
+  * `ctor`：高速缓存的构造函数（Linux的高速缓存不使用构造函数）
+  * 返回指向高速缓存的指针
+  * 函数调用可能会睡眠，不能再中断上下文使用
+
+```c
+struct kmem_cache *kmem_cache_create(const char *name, 
+                                    size_t size,
+                                    size_t align,
+                                    unsigned long flags,
+                                    void (*ctor)(void *));
+```
+
+* 撤销一个高速缓存（可能睡眠，不能再中断上下文使用）
+
+```c
+int kmem_cache_destroy(struct kmem_cache *cachep);
+```
+
+**注意**：调用`kmem_cache_destroy`之前要确保两个条件： 
+
+1. 高速缓存中的所有slab为空
+2. 在调用此函数过程中不在访问这个高速缓存
+
+* 从已经创建的缓存中分配释放对象，使用示例详见**P219**
+
+```c
+void kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags);
+void kmem_cache_free(struct kmem_cache *cachep, void *objp);
+```
+
+### 12.7 栈上的静态分配
+
+
+
 ## 第13章 虚拟文件系统
 
 > 虚拟文件系统（VFS）： 作为内核子系统，为用户空间程序提供了文件和文件系统相关的接口
@@ -196,11 +416,13 @@ struct file_struct{
 1. 对于多数进程，它们的描述符都指向自己独有的`file_struct`和`fs_struct`，除非使用克隆标志`CLONE_FILES`或者`CLONE_FS`创建的进程会共享这两个结构体
 2. `namespace`结构体使用方法和前两种结构完全不同，默认情况下，所有进程共享同样的命名空间（都从相同的挂载表中看到同一个文件系统层次结构，除非在`cloen()`操作时使用`CLONE_NEWS`标志，才会给进程一个命名空间结构体的拷贝）
 
-
-
-
-
 ## 第14章 块I/O层
+
+## 第15章 进程地址空间
+
+## 第16章 页高速缓存和页回写
+
+
 
 
 
